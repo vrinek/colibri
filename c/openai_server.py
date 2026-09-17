@@ -1892,13 +1892,8 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                 reasoning = content.split("</think>")[0].split("<think>")[-1]
                 content = content.split("</think>")[-1]
             opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
-            calls = _glm53_tool_calls(message.get('tool_calls'))
-            # KV prefix reuse: the model emits `</think><tool_call>` with no newline when it has
-            # no text, but the template puts one there; that single token (id 198) at the
-            # generated/re-rendered boundary discards the whole cached prefix (glm53.c:2483).
-            if not content.strip():
-                calls = calls.lstrip("\n")
-            prompt.append(f"<|assistant|>{opened}{content.strip()}{calls}")
+            prompt.append(f"<|assistant|>{opened}{content.strip()}"
+                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
         else:
             raise APIError(400, f"unsupported message role {role!r}.", "messages")
 
