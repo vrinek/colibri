@@ -70,6 +70,7 @@
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#include "prefix_equiv.h"
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 static int g_vk_ready = 0;
@@ -2292,14 +2293,6 @@ static void slot_reset(const GModel *m, KVSlot *slot) {
     slot->n = 0;
 }
 
-/* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. */
-static int slot_shared(const KVSlot *slot, const int *tokens, int n) {
-    int shared = 0;
-    while (shared < slot->n && shared < n && slot->tokens[shared] == tokens[shared])
-        shared++;
-    return shared;
-}
-
 static void slot_remember(KVSlot *slot, const int *tokens, int n) {
     if (n > slot->cap) {
         slot->tokens = realloc(slot->tokens, (size_t)n * sizeof(int));
@@ -2349,6 +2342,38 @@ static int g_stop[16], g_nstop = 0;
  * il rumore dell'argmax a int4 preferisce l'id di uno stop al '<' giusto
  * (#401). Con SERVE=1 e basta, invece, `coli chat` non ha nessun filtro a
  * valle e gli stop gli servono tutti. */
+/* Le forme che il modello scrive e il template no (#1576).
+ *
+ * arm_stops qui sotto fa la stessa cosa con gli stop: una tabella in token,
+ * costruita col tokenizer appena caricato, perche' gli id dipendono dal
+ * modello. Le stringhe stanno qui e non in prefix_equiv.h per la stessa
+ * ragione per cui gli stop stanno qui: quel file non vede mai testo. */
+static ColiEquivTable g_equiv;
+
+static void arm_equiv(Tok *tokenizer) {
+    static const struct { const char *cached, *prompt; } forms[] = {
+        /* Su un turno che e' SOLO una chiamata a strumento il modello scrive
+         * `</think><tool_call>`; il template ci mette un newline in mezzo. Un
+         * token, e il turno dopo rimacina tutto il prefisso. */
+        { "</think><tool_call>", "</think>\n<tool_call>" },
+    };
+    g_equiv.n = 0;
+    if (!tokenizer) return;
+    for (size_t f = 0; f < sizeof(forms) / sizeof(*forms); f++) {
+        int a[COLI_EQUIV_MAX_LEN], b[COLI_EQUIV_MAX_LEN];
+        const int na = tok_encode(tokenizer, forms[f].cached,
+                                  (int)strlen(forms[f].cached), a, COLI_EQUIV_MAX_LEN);
+        const int nb = tok_encode(tokenizer, forms[f].prompt,
+                                  (int)strlen(forms[f].prompt), b, COLI_EQUIV_MAX_LEN);
+        /* Un rifiuto non e' fatale: senza la coppia si torna al comportamento
+         * di prima, che e' lento e non sbagliato. */
+        if (!coli_equiv_add(&g_equiv, a, na, b, nb))
+            fprintf(stderr, "[equiv] coppia scartata: %s\n", forms[f].cached);
+    }
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "[equiv] %d coppie armate\n", g_equiv.n);
+}
+
 static void arm_stops(const char *dir, Tok *tokenizer, int batched) {
     g_nstop = load_stops(dir, g_stop, 16);
     if (!batched && tokenizer)
@@ -2480,8 +2505,21 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * riavvolge, quindi una divergenza a meta' cache obbliga a rifare. */
     const int cached = slot->session ? slot->session->filled : 0;
     int shared = 0;
-    if (cached > 0 && cached < total && slot_shared(slot, sequence, total) >= cached)
-        shared = cached;
+    if (cached > 0) {
+        /* #1576: una divergenza elencata in g_equiv non butta la cache. La
+         * sequenza nuova viene riscritta nella forma che lo slot ha davvero
+         * macinato, perche' le due forme hanno lunghezze diverse e tenersi
+         * quella del client lascerebbe tutto il resto sfasato di una posizione
+         * rispetto allo stato su cui lo si innesta. Con la tabella vuota questo
+         * e' esattamente il confronto di prima.
+         *
+         * Prima del test su `total`, che la riscrittura puo' cambiare; il tetto
+         * e' room-1 perche' oltre c'e' il BAD_REQUEST di poco sopra.
+         * `prompt_tokens` resta il conto che il client ha mandato. */
+        const int common = coli_equiv_reconcile(&g_equiv, slot->tokens, slot->n,
+                                                sequence, &total, room - 1);
+        if (common >= cached && cached < total) shared = cached;
+    }
     if (shared <= 0) {
         slot_reset(m, slot);
         slot->session = session_open(m, room);
@@ -2621,6 +2659,7 @@ int main(int argc, char **argv) {
         tok_load(&serve_tok, tokenizer_path);
         const char *batch = getenv("SERVE_BATCH");
         arm_stops(snap, &serve_tok, batch && atoi(batch));
+        arm_equiv(&serve_tok);
         serve_loop(&served, &serve_tok);
         tok_free(&serve_tok);
         return 0;
